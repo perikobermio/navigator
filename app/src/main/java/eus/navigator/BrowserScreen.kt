@@ -4,6 +4,7 @@ package eus.navigator
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -23,10 +25,14 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Android
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -38,8 +44,11 @@ import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Menu
@@ -50,6 +59,8 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -62,6 +73,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
@@ -94,7 +107,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -105,11 +121,13 @@ import java.io.File
 private sealed interface Dialog {
 	data object NewFolder : Dialog
 	data object NewFile : Dialog
-	data class Rename(val file: File) : Dialog
-	data class Delete(val files: List<File>) : Dialog
-	data class Details(val files: List<File>) : Dialog
+	data class Rename(val loc: Loc) : Dialog
+	data class Delete(val items: List<Loc>) : Dialog
+	data class Details(val entries: List<Entry>) : Dialog
 	data class AddShortcut(val file: File) : Dialog
 	data class RenameShortcut(val shortcut: Shortcut) : Dialog
+	data class EditServer(val server: Server?) : Dialog
+	data class SendTo(val items: List<Loc>) : Dialog
 }
 
 @Composable
@@ -122,7 +140,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 	BackHandler(drawer.isOpen) { scope.launch { drawer.close() } }
 	BackHandler(!drawer.isOpen && vm.selection.isNotEmpty()) { vm.clearSelection() }
 	BackHandler(!drawer.isOpen && vm.selection.isEmpty() && vm.query != null) { vm.query = null }
-	BackHandler(!drawer.isOpen && vm.selection.isEmpty() && vm.query == null && vm.currentRoot?.dir?.path != vm.dir.path) {
+	BackHandler(!drawer.isOpen && vm.selection.isEmpty() && vm.query == null && !vm.atRoot) {
 		vm.goUp()
 	}
 
@@ -130,10 +148,15 @@ fun BrowserScreen(vm: BrowserViewModel) {
 		scope.launch { drawer.close() }
 		val f = File(s.path)
 		when {
-			f.isDirectory -> vm.open(f)
-			f.isFile -> { f.parentFile?.let(vm::open); FileOps.open(ctx, f) }
+			f.isDirectory -> vm.open(LocalLoc(f))
+			f.isFile -> { f.parentFile?.let { vm.open(LocalLoc(it)) }; FileOps.open(ctx, f) }
 			else -> vm.toast("«${s.name}» ya no existe")
 		}
+	}
+
+	fun openServer(s: Server) {
+		scope.launch { drawer.close() }
+		vm.openServer(s)
 	}
 
 	ModalNavigationDrawer(
@@ -141,10 +164,12 @@ fun BrowserScreen(vm: BrowserViewModel) {
 		drawerContent = {
 			Drawer(
 				vm = vm,
-				onRoot = { scope.launch { drawer.close() }; vm.open(it.dir) },
+				onRoot = { scope.launch { drawer.close() }; vm.open(LocalLoc(it.dir)) },
 				onShortcut = ::openShortcut,
-				onAddCurrent = { dialog = Dialog.AddShortcut(vm.dir) },
+				onAddCurrent = { (vm.dir as? LocalLoc)?.let { dialog = Dialog.AddShortcut(it.file) } ?: vm.toast("Solo carpetas locales") },
 				onRenameShortcut = { dialog = Dialog.RenameShortcut(it) },
+				onServer = ::openServer,
+				onEditServer = { dialog = Dialog.EditServer(it) },
 			)
 		},
 	) {
@@ -163,7 +188,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 			},
 			bottomBar = { vm.clip?.let { PasteBar(it, vm) } },
 		) { padding ->
-			FileList(vm, padding, onOpenFile = { FileOps.open(ctx, it.file) })
+			FileList(vm, padding, onOpenFile = { e -> vm.withLocalFiles(listOf(e)) { FileOps.open(ctx, it[0]) } })
 		}
 	}
 
@@ -185,7 +210,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 		null -> {}
 		Dialog.NewFolder -> NameDialog("Nueva carpeta", "", onDismiss = { dialog = null }) { vm.createFolder(it) }
 		Dialog.NewFile -> NameDialog("Nuevo archivo", "", onDismiss = { dialog = null }) { vm.createFile(it) }
-		is Dialog.Rename -> NameDialog("Renombrar", d.file.name, onDismiss = { dialog = null }) { vm.rename(d.file, it) }
+		is Dialog.Rename -> NameDialog("Renombrar", d.loc.name, onDismiss = { dialog = null }) { vm.rename(d.loc, it) }
 		is Dialog.AddShortcut -> NameDialog("Nombre del acceso directo", d.file.name.ifEmpty { d.file.path }, onDismiss = { dialog = null }) {
 			vm.addShortcut(d.file, it)
 		}
@@ -197,31 +222,36 @@ fun BrowserScreen(vm: BrowserViewModel) {
 			title = { Text("¿Borrar?") },
 			text = {
 				Text(
-					if (d.files.size == 1) "«${d.files[0].name}» se borrará definitivamente."
-					else "${d.files.size} elementos se borrarán definitivamente."
+					if (d.items.size == 1) "«${d.items[0].name}» se borrará definitivamente."
+					else "${d.items.size} elementos se borrarán definitivamente."
 				)
 			},
-			confirmButton = { TextButton({ vm.delete(d.files); dialog = null }) { Text("Borrar") } },
+			confirmButton = { TextButton({ vm.delete(d.items); dialog = null }) { Text("Borrar") } },
 			dismissButton = { TextButton({ dialog = null }) { Text("Cancelar") } },
 		)
-		is Dialog.Details -> DetailsDialog(d.files) { dialog = null }
+		is Dialog.Details -> DetailsDialog(d.entries) { dialog = null }
+		is Dialog.EditServer -> ServerDialog(d.server, onDismiss = { dialog = null }, onSave = vm::saveServer)
+		is Dialog.SendTo -> SendDialog(vm, d.items) { dialog = null }
 	}
 }
 
 @Composable
 private fun MainBar(vm: BrowserViewModel, onMenu: () -> Unit, onDialog: (Dialog) -> Unit) {
 	var menu by remember { mutableStateOf(false) }
-	val isShortcut = vm.shortcuts.any { it.path == vm.dir.path }
+	val local = vm.dir as? LocalLoc
+	val isShortcut = local != null && vm.shortcuts.any { it.path == local.path }
 	TopAppBar(
 		navigationIcon = { IconButton(onMenu) { Icon(Icons.Default.Menu, "Menú") } },
 		title = {
 			Text(
-				if (vm.currentRoot?.dir?.path == vm.dir.path) vm.currentRoot!!.name else vm.dir.name,
+				if (vm.atRoot) vm.root?.first ?: vm.dir.name else vm.dir.name,
 				maxLines = 1, overflow = TextOverflow.Ellipsis,
 			)
 		},
 		actions = {
-			IconButton({ if (isShortcut) vm.removeShortcut(vm.shortcuts.first { it.path == vm.dir.path }) else onDialog(Dialog.AddShortcut(vm.dir)) }) {
+			if (local != null) IconButton({
+				if (isShortcut) vm.removeShortcut(vm.shortcuts.first { it.path == local.path }) else onDialog(Dialog.AddShortcut(local.file))
+			}) {
 				Icon(if (isShortcut) Icons.Filled.Star else Icons.Outlined.Star, "Acceso directo")
 			}
 			IconButton({ vm.query = "" }) { Icon(Icons.Default.Search, "Buscar") }
@@ -260,6 +290,7 @@ private fun SelectionBar(vm: BrowserViewModel, onDialog: (Dialog) -> Unit) {
 		navigationIcon = { IconButton(vm::clearSelection) { Icon(Icons.Default.Close, "Cancelar") } },
 		title = { Text("${sel.size}") },
 		actions = {
+			IconButton({ onDialog(Dialog.SendTo(sel)) }) { Icon(Icons.AutoMirrored.Filled.Send, "Enviar a…") }
 			IconButton({ vm.copySelection(cut = false) }) { Icon(Icons.Default.ContentCopy, "Copiar") }
 			IconButton({ vm.copySelection(cut = true) }) { Icon(Icons.Default.ContentCut, "Mover") }
 			IconButton({ onDialog(Dialog.Delete(sel)) }) { Icon(Icons.Default.Delete, "Borrar") }
@@ -268,10 +299,12 @@ private fun SelectionBar(vm: BrowserViewModel, onDialog: (Dialog) -> Unit) {
 				DropdownMenuItem({ Text("Seleccionar todo") }, { menu = false; vm.selectAll() })
 				if (sel.size == 1) {
 					DropdownMenuItem({ Text("Renombrar") }, { menu = false; onDialog(Dialog.Rename(sel[0])) })
-					DropdownMenuItem({ Text("Crear acceso directo") }, { menu = false; onDialog(Dialog.AddShortcut(sel[0])) })
+					(sel[0] as? LocalLoc)?.let { l ->
+						DropdownMenuItem({ Text("Crear acceso directo") }, { menu = false; onDialog(Dialog.AddShortcut(l.file)) })
+					}
 				}
-				DropdownMenuItem({ Text("Compartir") }, { menu = false; FileOps.share(ctx, sel) })
-				DropdownMenuItem({ Text("Detalles") }, { menu = false; onDialog(Dialog.Details(sel)) })
+				DropdownMenuItem({ Text("Compartir") }, { menu = false; vm.withLocalFiles(vm.selectedEntries) { FileOps.share(ctx, it) } })
+				DropdownMenuItem({ Text("Detalles") }, { menu = false; onDialog(Dialog.Details(vm.selectedEntries)) })
 			}
 		},
 	)
@@ -303,12 +336,12 @@ private fun SearchBar(vm: BrowserViewModel) {
 
 @Composable
 private fun Breadcrumbs(vm: BrowserViewModel) {
-	val root = vm.currentRoot ?: return
-	val crumbs = remember(vm.dir, root) {
-		val list = mutableListOf(root.name to root.dir)
-		var acc = root.dir
-		vm.dir.path.removePrefix(root.dir.path).split('/').filter { it.isNotEmpty() }.forEach {
-			acc = File(acc, it)
+	val (rootName, rootLoc) = vm.root ?: return
+	val crumbs = remember(vm.dir, rootLoc) {
+		val list = mutableListOf(rootName to rootLoc)
+		var acc = rootLoc
+		vm.dir.path.removePrefix(rootLoc.path).split('/').filter { it.isNotEmpty() }.forEach {
+			acc = acc.child(it)
 			list += it to acc
 		}
 		list
@@ -344,19 +377,28 @@ private fun Breadcrumbs(vm: BrowserViewModel) {
 private fun FileList(vm: BrowserViewModel, padding: PaddingValues, onOpenFile: (Entry) -> Unit) {
 	val items = vm.visible
 	if (items.isEmpty() && !vm.loading) {
-		Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-			Text(
-				if (vm.query.isNullOrBlank()) "Carpeta vacía" else "Sin resultados",
-				color = MaterialTheme.colorScheme.onSurfaceVariant,
-			)
+		Box(Modifier.fillMaxSize().padding(padding).padding(32.dp), contentAlignment = Alignment.Center) {
+			val err = vm.loadError
+			if (err != null) {
+				Column(horizontalAlignment = Alignment.CenterHorizontally) {
+					Text(err, color = MaterialTheme.colorScheme.error)
+					Spacer(Modifier.height(12.dp))
+					TextButton(vm::refresh) { Text("Reintentar") }
+				}
+			} else {
+				Text(
+					if (vm.query.isNullOrBlank()) "Carpeta vacía" else "Sin resultados",
+					color = MaterialTheme.colorScheme.onSurfaceVariant,
+				)
+			}
 		}
 		return
 	}
 	val state = rememberLazyListState()
 	LaunchedEffect(vm.dir) { state.scrollToItem(0) }
 	LazyColumn(state = state, contentPadding = padding, modifier = Modifier.fillMaxSize()) {
-		items(items, key = { it.file.path }) { e ->
-			val selected = e.file in vm.selection
+		items(items, key = { it.loc.path }) { e ->
+			val selected = e.loc in vm.selection
 			Row(
 				verticalAlignment = Alignment.CenterVertically,
 				modifier = Modifier
@@ -365,12 +407,12 @@ private fun FileList(vm: BrowserViewModel, padding: PaddingValues, onOpenFile: (
 					.combinedClickable(
 						onClick = {
 							when {
-								vm.selection.isNotEmpty() -> vm.toggle(e.file)
-								e.isDir -> vm.open(e.file)
+								vm.selection.isNotEmpty() -> vm.toggle(e.loc)
+								e.isDir -> vm.open(e.loc)
 								else -> onOpenFile(e)
 							}
 						},
-						onLongClick = { vm.toggle(e.file) },
+						onLongClick = { vm.toggle(e.loc) },
 					)
 					.padding(horizontal = 16.dp, vertical = 10.dp),
 			) {
@@ -393,7 +435,8 @@ private fun FileList(vm: BrowserViewModel, padding: PaddingValues, onOpenFile: (
 				Column(Modifier.weight(1f)) {
 					Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge)
 					Text(
-						(if (e.isDir) "${e.children} elementos" else FileOps.size(e.size)) + " · " + FileOps.date(e.modified),
+						(if (!e.isDir) FileOps.size(e.size) else if (e.children >= 0) "${e.children} elementos" else "Carpeta") +
+							" · " + FileOps.date(e.modified),
 						style = MaterialTheme.typography.bodySmall,
 						color = MaterialTheme.colorScheme.onSurfaceVariant,
 					)
@@ -411,7 +454,7 @@ private fun PasteBar(clip: Clip, vm: BrowserViewModel) {
 			modifier = Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp),
 		) {
 			Text(
-				"${clip.files.size} para ${if (clip.cut) "mover" else "copiar"}",
+				"${clip.items.size} para ${if (clip.cut) "mover" else "copiar"}",
 				modifier = Modifier.weight(1f),
 				style = MaterialTheme.typography.bodyMedium,
 			)
@@ -429,6 +472,8 @@ private fun Drawer(
 	onShortcut: (Shortcut) -> Unit,
 	onAddCurrent: () -> Unit,
 	onRenameShortcut: (Shortcut) -> Unit,
+	onServer: (Server) -> Unit,
+	onEditServer: (Server?) -> Unit,
 ) {
 	val ctx = LocalContext.current
 	ModalDrawerSheet {
@@ -462,33 +507,29 @@ private fun Drawer(
 				}
 			}
 			if (vm.shortcuts.isEmpty()) item {
-				Text(
-					"Pulsa + o la estrella para guardar la carpeta actual.\nMantén pulsado un archivo o carpeta para crear uno.",
-					style = MaterialTheme.typography.bodySmall,
-					color = MaterialTheme.colorScheme.onSurfaceVariant,
-					modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-				)
+				Hint("Pulsa + o la estrella para guardar la carpeta actual.\nMantén pulsado un archivo o carpeta para crear uno.")
 			}
 			itemsIndexed(vm.shortcuts, key = { _, s -> s.path }) { i, s ->
 				var menu by remember { mutableStateOf(false) }
 				val f = File(s.path)
 				NavigationDrawerItem(
-					icon = { Icon(if (f.isFile) iconForName(f.name) else Icons.Default.Folder, null) },
-					label = {
-						Column {
-							Text(s.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-							Text(
-								s.path, maxLines = 1, overflow = TextOverflow.Ellipsis,
-								style = MaterialTheme.typography.bodySmall,
-								color = MaterialTheme.colorScheme.onSurfaceVariant,
-							)
-						}
+					icon = {
+						Icon(
+							when {
+								vm.isStart(s) -> Icons.Default.Home
+								f.isFile -> iconForName(f.name)
+								else -> Icons.Default.Folder
+							},
+							null,
+						)
 					},
+					label = { TwoLines(s.name, s.path) },
 					badge = {
 						Box {
 							IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Opciones") }
 							DropdownMenu(menu, { menu = false }) {
 								DropdownMenuItem({ Text("Renombrar") }, { menu = false; onRenameShortcut(s) })
+								if (!f.isFile) StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
 								if (i > 0) DropdownMenuItem({ Text("Subir") }, { menu = false; vm.moveShortcut(s, -1) })
 								if (i < vm.shortcuts.lastIndex) DropdownMenuItem({ Text("Bajar") }, { menu = false; vm.moveShortcut(s, 1) })
 								DropdownMenuItem({ Text("Añadir a pantalla de inicio") }, { menu = false; pinToHome(ctx, s) })
@@ -496,12 +537,72 @@ private fun Drawer(
 							}
 						}
 					},
-					selected = vm.dir.path == s.path,
+					selected = vm.dir.path == s.path && vm.dir is LocalLoc,
 					onClick = { onShortcut(s) },
+				)
+			}
+			item {
+				HorizontalDivider(Modifier.padding(vertical = 8.dp))
+				Row(verticalAlignment = Alignment.CenterVertically) {
+					Box(Modifier.weight(1f)) { SectionTitle("Servidores SFTP") }
+					IconButton({ onEditServer(null) }) { Icon(Icons.Default.Add, "Añadir servidor") }
+				}
+			}
+			if (vm.servers.isEmpty()) item { Hint("Pulsa + para añadir un servidor SFTP.") }
+			itemsIndexed(vm.servers, key = { _, s -> "sftp:${s.id}" }) { i, s ->
+				var menu by remember { mutableStateOf(false) }
+				NavigationDrawerItem(
+					icon = { Icon(if (vm.isStart(s)) Icons.Default.Home else Icons.Default.Dns, null) },
+					label = { TwoLines(s.name, "${s.user}@${s.address}:${s.path.ifBlank { "~" }}") },
+					badge = {
+						Box {
+							IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Opciones") }
+							DropdownMenu(menu, { menu = false }) {
+								DropdownMenuItem({ Text("Editar") }, { menu = false; onEditServer(s) })
+								StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
+								if (i > 0) DropdownMenuItem({ Text("Subir") }, { menu = false; vm.moveServer(s, -1) })
+								if (i < vm.servers.lastIndex) DropdownMenuItem({ Text("Bajar") }, { menu = false; vm.moveServer(s, 1) })
+								DropdownMenuItem({ Text("Quitar") }, { menu = false; vm.removeServer(s) })
+							}
+						}
+					},
+					selected = (vm.dir as? RemoteLoc)?.server?.id == s.id,
+					onClick = { onServer(s) },
 				)
 			}
 		}
 	}
+}
+
+@Composable
+private fun StartMenuItem(isStart: Boolean, onClick: () -> Unit) {
+	DropdownMenuItem(
+		text = { Text(if (isStart) "No abrir al iniciar" else "Abrir al iniciar") },
+		onClick = onClick,
+		leadingIcon = { Icon(Icons.Default.Home, null) },
+	)
+}
+
+@Composable
+private fun TwoLines(title: String, subtitle: String) {
+	Column {
+		Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+		Text(
+			subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis,
+			style = MaterialTheme.typography.bodySmall,
+			color = MaterialTheme.colorScheme.onSurfaceVariant,
+		)
+	}
+}
+
+@Composable
+private fun Hint(text: String) {
+	Text(
+		text,
+		style = MaterialTheme.typography.bodySmall,
+		color = MaterialTheme.colorScheme.onSurfaceVariant,
+		modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+	)
 }
 
 @Composable
@@ -536,29 +637,153 @@ private fun NameDialog(title: String, initial: String, onDismiss: () -> Unit, on
 }
 
 @Composable
-private fun DetailsDialog(files: List<File>, onDismiss: () -> Unit) {
-	val totals by produceState<Pair<Long, Int>?>(null, files) {
-		value = withContext(Dispatchers.IO) { FileOps.totals(files) }
+private fun DetailsDialog(entries: List<Entry>, onDismiss: () -> Unit) {
+	val totals by produceState<Result<Pair<Long, Int>>?>(null, entries) {
+		value = withContext(Dispatchers.IO) { runCatching { Fs.totals(entries) } }
 	}
-	val single = files.singleOrNull()
+	val single = entries.singleOrNull()
 	AlertDialog(
 		onDismissRequest = onDismiss,
-		title = { Text(single?.name ?: "${files.size} elementos", maxLines = 2, overflow = TextOverflow.Ellipsis) },
+		title = { Text(single?.name ?: "${entries.size} elementos", maxLines = 2, overflow = TextOverflow.Ellipsis) },
 		text = {
 			Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-				val size = totals?.let { (bytes, count) ->
-					FileOps.size(bytes) + if (single?.isFile == true) "" else " · $count archivos"
-				} ?: "Calculando…"
+				val size = when (val t = totals) {
+					null -> "Calculando…"
+					else -> t.fold(
+						{ (bytes, count) -> FileOps.size(bytes) + if (single?.isDir == false) "" else " · $count archivos" },
+						{ "No disponible" },
+					)
+				}
 				if (single != null) {
-					Detail("Ruta", single.path)
-					Detail("Tipo", if (single.isDirectory) "Carpeta" else FileOps.mime(single))
-					Detail("Modificado", FileOps.date(single.lastModified()))
+					val loc = single.loc
+					Detail("Ruta", if (loc is RemoteLoc) "${loc.server.user}@${loc.server.address}:${loc.path}" else loc.path)
+					Detail("Tipo", if (single.isDir) "Carpeta" else FileOps.mime(single.name))
+					Detail("Modificado", FileOps.date(single.modified))
 				}
 				Detail("Tamaño", size)
-				if (single != null) Detail("Permisos", (if (single.canRead()) "Lectura" else "") + (if (single.canWrite()) " · Escritura" else ""))
+				(single?.loc as? LocalLoc)?.file?.let { f ->
+					Detail("Permisos", (if (f.canRead()) "Lectura" else "") + (if (f.canWrite()) " · Escritura" else ""))
+				}
 			}
 		},
 		confirmButton = { TextButton(onDismiss) { Text("Cerrar") } },
+	)
+}
+
+@Composable
+private fun ServerDialog(initial: Server?, onDismiss: () -> Unit, onSave: (Server) -> Unit) {
+	var name by remember { mutableStateOf(initial?.name.orEmpty()) }
+	var host by remember { mutableStateOf(initial?.address.orEmpty()) }
+	var user by remember { mutableStateOf(initial?.user.orEmpty()) }
+	var password by remember { mutableStateOf(initial?.password.orEmpty()) }
+	var path by remember { mutableStateOf(initial?.path.orEmpty()) }
+	var showPassword by remember { mutableStateOf(false) }
+	AlertDialog(
+		onDismissRequest = onDismiss,
+		title = { Text(if (initial == null) "Nuevo servidor SFTP" else "Editar servidor") },
+		text = {
+			Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+				OutlinedTextField(name, { name = it }, label = { Text("Nombre") }, placeholder = { Text(host.ifBlank { "Mi servidor" }) }, singleLine = true)
+				OutlinedTextField(
+					host, { host = it }, label = { Text("Host") }, supportingText = { Text("host o host:puerto") }, singleLine = true,
+					keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+				)
+				OutlinedTextField(user, { user = it }, label = { Text("Usuario") }, singleLine = true)
+				OutlinedTextField(
+					password, { password = it }, label = { Text("Contraseña") }, singleLine = true,
+					visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
+					keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+					trailingIcon = {
+						IconButton({ showPassword = !showPassword }) {
+							Icon(if (showPassword) Icons.Default.VisibilityOff else Icons.Default.Visibility, "Mostrar contraseña")
+						}
+					},
+				)
+				OutlinedTextField(
+					path, { path = it }, label = { Text("Ruta") }, placeholder = { Text("/var/www") },
+					supportingText = { Text("Vacío: carpeta personal") }, singleLine = true,
+				)
+			}
+		},
+		confirmButton = {
+			TextButton(
+				onClick = {
+					val raw = host.trim()
+					// Admite "host:puerto"; con más de un ":" se asume una IPv6 sin puerto.
+					val parts = raw.split(':')
+					val (h, port) = parts.takeIf { it.size == 2 }?.get(1)?.toIntOrNull()?.let { parts[0] to it } ?: (raw to 22)
+					val n = name.trim().ifEmpty { h }
+					val p = path.trim()
+					onSave(
+						initial?.copy(name = n, host = h, port = port, user = user.trim(), password = password, path = p)
+							?: Server(name = n, host = h, port = port, user = user.trim(), password = password, path = p)
+					)
+					onDismiss()
+				},
+				enabled = host.isNotBlank() && user.isNotBlank(),
+			) { Text("Guardar") }
+		},
+		dismissButton = { TextButton(onDismiss) { Text("Cancelar") } },
+	)
+}
+
+@Composable
+private fun SendDialog(vm: BrowserViewModel, items: List<Loc>, onDismiss: () -> Unit) {
+	var cut by remember { mutableStateOf(false) }
+	val folders = remember(vm.shortcuts) { vm.shortcuts.filter { File(it.path).isDirectory } }
+	AlertDialog(
+		onDismissRequest = onDismiss,
+		title = { Text(if (items.size == 1) "Enviar «${items[0].name}» a…" else "Enviar ${items.size} elementos a…", maxLines = 2, overflow = TextOverflow.Ellipsis) },
+		text = {
+			Column {
+				Row(
+					verticalAlignment = Alignment.CenterVertically,
+					modifier = Modifier.fillMaxWidth().clip(CircleShape).clickable { cut = !cut },
+				) {
+					Checkbox(cut, { cut = it })
+					Text("Mover (quitar del origen)")
+				}
+				HorizontalDivider(Modifier.padding(vertical = 8.dp))
+				LazyColumn(Modifier.heightIn(max = 400.dp)) {
+					if (folders.isNotEmpty()) item { DestHeader("Accesos directos") }
+					items(folders) { s ->
+						Dest(Icons.Default.Folder, s.name, s.path) { vm.sendTo(items, s, cut); onDismiss() }
+					}
+					if (vm.servers.isNotEmpty()) item { DestHeader("Servidores SFTP") }
+					items(vm.servers) { s ->
+						Dest(Icons.Default.Dns, s.name, "${s.user}@${s.address}:${s.path.ifBlank { "~" }}") { vm.sendTo(items, s, cut); onDismiss() }
+					}
+					item {
+						Dest(Icons.Default.FolderOpen, "Otra carpeta…", "Navega hasta el destino y pulsa Pegar") {
+							vm.copyToClip(items, cut); onDismiss()
+						}
+					}
+				}
+			}
+		},
+		confirmButton = {},
+		dismissButton = { TextButton(onDismiss) { Text("Cancelar") } },
+	)
+}
+
+@Composable
+private fun DestHeader(text: String) {
+	Text(
+		text,
+		style = MaterialTheme.typography.labelLarge,
+		color = MaterialTheme.colorScheme.primary,
+		modifier = Modifier.padding(start = 16.dp, top = 8.dp, bottom = 4.dp),
+	)
+}
+
+@Composable
+private fun Dest(icon: ImageVector, title: String, subtitle: String, onClick: () -> Unit) {
+	ListItem(
+		headlineContent = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+		supportingContent = { Text(subtitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+		leadingContent = { Icon(icon, null) },
+		colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+		modifier = Modifier.clip(MaterialTheme.shapes.medium).clickable(onClick = onClick),
 	)
 }
 

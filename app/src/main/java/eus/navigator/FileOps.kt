@@ -16,8 +16,9 @@ import java.io.File
 import java.text.DateFormat
 import java.util.Date
 
+/** [children] es -1 cuando no se conoce (carpetas remotas). */
 data class Entry(
-	val file: File,
+	val loc: Loc,
 	val name: String,
 	val isDir: Boolean,
 	val size: Long,
@@ -30,14 +31,14 @@ data class StorageRoot(val name: String, val dir: File, val removable: Boolean)
 enum class SortBy { NAME, DATE, SIZE, TYPE }
 
 object FileOps {
-	fun list(dir: File, showHidden: Boolean, sort: SortBy, descending: Boolean): List<Entry> {
+	fun list(dir: File, showHidden: Boolean): List<Entry> {
 		val files = dir.listFiles() ?: return emptyList()
-		val entries = files
+		return files
 			.filter { showHidden || !it.name.startsWith(".") }
 			.map { f ->
 				val isDir = f.isDirectory
 				Entry(
-					file = f,
+					loc = LocalLoc(f),
 					name = f.name,
 					isDir = isDir,
 					size = if (isDir) 0 else f.length(),
@@ -45,11 +46,14 @@ object FileOps {
 					children = if (isDir) f.list()?.size ?: 0 else 0,
 				)
 			}
+	}
+
+	fun sorted(entries: List<Entry>, sort: SortBy, descending: Boolean): List<Entry> {
 		val byField: Comparator<Entry> = when (sort) {
 			SortBy.NAME -> compareBy(String.CASE_INSENSITIVE_ORDER) { it.name }
 			SortBy.DATE -> compareBy { it.modified }
 			SortBy.SIZE -> compareBy { if (it.isDir) it.children.toLong() else it.size }
-			SortBy.TYPE -> compareBy<Entry> { it.file.extension.lowercase() }
+			SortBy.TYPE -> compareBy<Entry> { it.name.substringAfterLast('.', "").lowercase() }
 				.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
 		}
 		// Las carpetas siempre van primero, sea cual sea el orden.
@@ -118,8 +122,10 @@ object FileOps {
 		if (!src.deleteRecursively()) error("Copiado, pero no se pudo borrar el original de ${src.name}")
 	}
 
-	fun mime(file: File): String =
-		MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+	fun mime(file: File): String = mime(file.name)
+
+	fun mime(name: String): String =
+		MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase()) ?: "*/*"
 
 	private fun uri(context: Context, file: File): Uri =
 		FileProvider.getUriForFile(context, "${context.packageName}.files", file)

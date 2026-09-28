@@ -7,30 +7,34 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-data class Clip(val files: List<File>, val cut: Boolean)
+data class Clip(val items: List<Loc>, val cut: Boolean)
 
 class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	private val prefs = app.getSharedPreferences("settings", 0)
 	private val store = ShortcutStore(app)
+	private val serverStore = ServerStore(app)
 
 	var roots by mutableStateOf(FileOps.roots(app))
 		private set
-	var dir by mutableStateOf(roots.first().dir)
+	var dir by mutableStateOf<Loc>(LocalLoc(roots.first().dir))
 		private set
 	var entries by mutableStateOf(emptyList<Entry>())
 		private set
 	var loading by mutableStateOf(false)
 		private set
+	var loadError by mutableStateOf<String?>(null)
+		private set
 	var busy by mutableStateOf<String?>(null)
 		private set
 
-	var selection by mutableStateOf(emptySet<File>())
+	var selection by mutableStateOf(emptySet<Loc>())
 		private set
 	var clip by mutableStateOf<Clip?>(null)
 		private set
@@ -45,25 +49,59 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	var shortcuts by mutableStateOf(store.load())
 		private set
+	var servers by mutableStateOf(serverStore.load())
+		private set
+
+	/** Ubicación que se abre al iniciar: "path:<ruta>" para un acceso directo o "sftp:<id>" para un servidor. */
+	var start by mutableStateOf(prefs.getString("start", null))
+		private set
 
 	private var loadJob: Job? = null
+	private var connectJob: Job? = null
+
+	init {
+		Sftp.init(app)
+		openStart()
+	}
+
+	override fun onCleared() {
+		Sftp.closeAll()
+	}
 
 	val visible: List<Entry>
 		get() = query?.takeIf { it.isNotBlank() }
 			?.let { q -> entries.filter { it.name.contains(q, ignoreCase = true) } }
 			?: entries
 
-	/** Volumen al que pertenece la carpeta actual (el más específico). */
+	val selectedEntries: List<Entry>
+		get() = entries.filter { it.loc in selection }
+
+	/** Volumen al que pertenece la carpeta actual (el más específico), si es local. */
 	val currentRoot: StorageRoot?
-		get() = roots.filter { FileOps.isInside(dir, it.dir) }.maxByOrNull { it.dir.path.length }
+		get() = (dir as? LocalLoc)?.let { d -> roots.filter { FileOps.isInside(d.file, it.dir) }.maxByOrNull { it.dir.path.length } }
+
+	/** Raíz de la ubicación actual (volumen local o "/" del servidor) y su nombre visible. */
+	val root: Pair<String, Loc>?
+		get() = when (val d = dir) {
+			is LocalLoc -> currentRoot?.let { it.name to LocalLoc(it.dir) }
+			is RemoteLoc -> d.server.name to RemoteLoc(d.server, "/")
+		}
+
+	val atRoot: Boolean
+		get() = root?.second?.path?.let { it == dir.path } ?: true
 
 	fun refreshRoots() {
 		roots = FileOps.roots(getApplication())
 		refresh()
 	}
 
-	fun open(target: File) {
-		if (!target.isDirectory) return toast("La carpeta no existe")
+	fun open(target: Loc) {
+		connectJob?.cancel()
+		show(target)
+	}
+
+	private fun show(target: Loc) {
+		if (target is LocalLoc && !target.file.isDirectory) return toast("La carpeta no existe")
 		dir = target
 		selection = emptySet()
 		query = null
@@ -71,9 +109,8 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	}
 
 	fun goUp(): Boolean {
-		val root = currentRoot ?: return false
-		if (dir.canonicalPath == root.dir.canonicalPath) return false
-		dir.parentFile?.let(::open) ?: return false
+		if (atRoot) return false
+		dir.parent?.let(::open) ?: return false
 		return true
 	}
 
@@ -82,8 +119,16 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		val d = dir
 		loadJob = viewModelScope.launch {
 			loading = true
-			entries = withContext(Dispatchers.IO) { FileOps.list(d, showHidden, sort, descending) }
-			selection = selection.filter { it.exists() }.toSet()
+			try {
+				entries = withContext(Dispatchers.IO) { Fs.list(d, showHidden, sort, descending) }
+				loadError = null
+			} catch (e: CancellationException) {
+				throw e
+			} catch (e: Exception) {
+				entries = emptyList()
+				loadError = e.message ?: "Error"
+			}
+			selection = selection.filter { s -> entries.any { it.loc == s } }.toSet()
 			loading = false
 		}
 	}
@@ -103,12 +148,12 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	// --- Selección ---
 
-	fun toggle(file: File) {
-		selection = if (file in selection) selection - file else selection + file
+	fun toggle(loc: Loc) {
+		selection = if (loc in selection) selection - loc else selection + loc
 	}
 
 	fun selectAll() {
-		selection = visible.map { it.file }.toSet()
+		selection = visible.map { it.loc }.toSet()
 	}
 
 	fun clearSelection() {
@@ -117,8 +162,10 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	// --- Operaciones ---
 
-	fun copySelection(cut: Boolean) {
-		clip = Clip(selection.toList(), cut)
+	fun copySelection(cut: Boolean) = copyToClip(selection.toList(), cut)
+
+	fun copyToClip(items: List<Loc>, cut: Boolean) {
+		clip = Clip(items, cut)
 		selection = emptySet()
 		toast("Elige destino y pulsa Pegar")
 	}
@@ -130,47 +177,85 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	fun paste() {
 		val c = clip ?: return
 		val dest = dir
-		run(if (c.cut) "Moviendo…" else "Copiando…") {
-			c.files.forEach { if (c.cut) FileOps.move(it, dest) else FileOps.copy(it, dest) }
-			clip = null
+		transfer(c.items, cut = c.cut) { dest }
+		clip = null
+	}
+
+	/** Envía [items] a la carpeta de un acceso directo. */
+	fun sendTo(items: List<Loc>, s: Shortcut, cut: Boolean) = transfer(items, cut, s.name) { LocalLoc(File(s.path)) }
+
+	/** Envía [items] a la ruta inicial de un servidor. */
+	fun sendTo(items: List<Loc>, s: Server, cut: Boolean) =
+		transfer(items, cut, s.name) { RemoteLoc(s, Sftp.realPath(s, s.path)) }
+
+	private fun transfer(items: List<Loc>, cut: Boolean, destName: String? = null, dest: () -> Loc) {
+		selection = emptySet()
+		val verb = if (cut) "Moviendo" else "Copiando"
+		run("$verb…") {
+			val target = dest()
+			items.forEach { item ->
+				val progress = { name: String -> busy = "$verb «$name»…" }
+				if (cut) Fs.move(item, target, progress) else Fs.copy(item, target, progress)
+			}
+			if (destName != null) toast("${items.size} ${if (items.size == 1) "elemento" else "elementos"} a «$destName»")
 		}
 	}
 
-	fun delete(files: Collection<File>) {
+	fun delete(items: Collection<Loc>) {
 		run("Borrando…") {
-			val failed = files.filterNot { it.deleteRecursively() }
-			if (failed.isNotEmpty()) error("No se pudieron borrar ${failed.size} elementos")
+			var failed = 0
+			items.forEach { runCatching { Fs.delete(it) }.onFailure { failed++ } }
+			if (failed > 0) error("No se pudieron borrar $failed elementos")
 		}
 		selection = emptySet()
 	}
 
-	fun rename(file: File, newName: String) {
+	fun rename(loc: Loc, newName: String) {
 		val name = newName.trim()
 		if (!validName(name)) return toast("Nombre no válido")
-		val target = File(file.parentFile, name)
-		if (target.exists()) return toast("Ya existe «$name»")
-		if (!file.renameTo(target)) return toast("No se pudo renombrar")
-		shortcuts = shortcuts.map { if (it.path == file.path) it.copy(path = target.path) else it }.also(store::save)
+		val target = loc.parent?.child(name) ?: return
 		selection = emptySet()
-		refresh()
+		run("Renombrando…") {
+			if (Fs.exists(target)) error("Ya existe «$name»")
+			Fs.rename(loc, target)
+			if (loc is LocalLoc) {
+				shortcuts = shortcuts.map { if (it.path == loc.path) it.copy(path = target.path) else it }.also(store::save)
+				if (start == "path:${loc.path}") saveStart("path:${target.path}")
+			}
+		}
 	}
 
-	fun createFolder(name: String) = create(name) { it.mkdir() }
+	fun createFolder(name: String) = create(name, Fs::mkdir)
 
-	fun createFile(name: String) = create(name) { it.createNewFile() }
+	fun createFile(name: String) = create(name, Fs::createFile)
 
-	private fun create(rawName: String, make: (File) -> Boolean) {
+	private fun create(rawName: String, make: (Loc) -> Unit) {
 		val name = rawName.trim()
 		if (!validName(name)) return toast("Nombre no válido")
-		val f = File(dir, name)
-		if (f.exists()) return toast("Ya existe «$name»")
-		if (!runCatching { make(f) }.getOrDefault(false)) return toast("No se pudo crear")
-		refresh()
+		val target = dir.child(name)
+		run("Creando…") {
+			if (Fs.exists(target)) error("Ya existe «$name»")
+			make(target)
+		}
+	}
+
+	/** Descarga (si hace falta) los archivos y se los pasa a [then] en el hilo principal, p. ej. para abrirlos. */
+	fun withLocalFiles(items: List<Entry>, then: (List<File>) -> Unit) {
+		val files = items.filter { !it.isDir }
+		if (files.isEmpty()) return toast("Solo se pueden usar archivos, no carpetas")
+		if (files.all { it.loc is LocalLoc }) return then(files.map { (it.loc as LocalLoc).file })
+		run("Descargando…", reload = false) {
+			val local = files.map { e ->
+				busy = "Descargando «${e.name}»…"
+				Fs.localCopy(getApplication(), e.loc)
+			}
+			withContext(Dispatchers.Main) { then(local) }
+		}
 	}
 
 	private fun validName(name: String) = name.isNotEmpty() && name != "." && name != ".." && '/' !in name
 
-	private fun run(label: String, block: suspend () -> Unit) {
+	private fun run(label: String, reload: Boolean = true, block: suspend () -> Unit) {
 		viewModelScope.launch {
 			busy = label
 			try {
@@ -179,7 +264,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 				toast(e.message ?: "Error")
 			} finally {
 				busy = null
-				refresh()
+				if (reload) refresh()
 			}
 		}
 	}
@@ -199,15 +284,80 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	fun removeShortcut(s: Shortcut) {
 		shortcuts = (shortcuts - s).also(store::save)
+		if (isStart(s)) saveStart(null)
 	}
 
 	fun moveShortcut(s: Shortcut, delta: Int) {
-		val list = shortcuts.toMutableList()
-		val i = list.indexOf(s)
+		shortcuts = swap(shortcuts, s, delta).also(store::save)
+	}
+
+	// --- Servidores SFTP ---
+
+	fun openServer(s: Server) {
+		connectJob?.cancel()
+		connectJob = viewModelScope.launch {
+			loading = true
+			try {
+				val path = withContext(Dispatchers.IO) { Sftp.realPath(s, s.path) }
+				show(RemoteLoc(s, path))
+			} catch (e: CancellationException) {
+				throw e
+			} catch (e: Exception) {
+				loading = false
+				toast("«${s.name}»: ${e.message}")
+			}
+		}
+	}
+
+	fun saveServer(s: Server) {
+		val old = servers.find { it.id == s.id }
+		// Guardar de nuevo un servidor también sirve para aceptar una clave de host que ha cambiado.
+		old?.let(Sftp::forget)
+		servers = (if (old == null) servers + s else servers.map { if (it.id == s.id) s else it }).also(serverStore::save)
+		if (old == null || (dir as? RemoteLoc)?.server?.id == s.id) openServer(s)
+	}
+
+	fun removeServer(s: Server) {
+		Sftp.forget(s)
+		servers = servers.filterNot { it.id == s.id }.also(serverStore::save)
+		if (isStart(s)) saveStart(null)
+		if ((dir as? RemoteLoc)?.server?.id == s.id) open(LocalLoc(roots.first().dir))
+	}
+
+	fun moveServer(s: Server, delta: Int) {
+		servers = swap(servers, s, delta).also(serverStore::save)
+	}
+
+	// --- Ubicación de inicio ---
+
+	fun isStart(s: Shortcut) = start == "path:${s.path}"
+
+	fun isStart(s: Server) = start == "sftp:${s.id}"
+
+	fun toggleStart(s: Shortcut) = saveStart(if (isStart(s)) null else "path:${s.path}")
+
+	fun toggleStart(s: Server) = saveStart(if (isStart(s)) null else "sftp:${s.id}")
+
+	private fun saveStart(key: String?) {
+		start = key
+		prefs.edit().putString("start", key).apply()
+	}
+
+	private fun openStart() {
+		val key = start ?: return
+		when {
+			key.startsWith("path:") -> File(key.removePrefix("path:")).takeIf { it.isDirectory }?.let { dir = LocalLoc(it) }
+			key.startsWith("sftp:") -> servers.find { it.id == key.removePrefix("sftp:") }?.let(::openServer)
+		}
+	}
+
+	private fun <T> swap(list: List<T>, item: T, delta: Int): List<T> {
+		val l = list.toMutableList()
+		val i = l.indexOf(item)
 		val j = i + delta
-		if (i < 0 || j !in list.indices) return
-		list[i] = list[j].also { list[j] = list[i] }
-		shortcuts = list.also(store::save)
+		if (i < 0 || j !in l.indices) return list
+		l[i] = l[j].also { l[j] = l[i] }
+		return l
 	}
 
 	fun toast(msg: String) {

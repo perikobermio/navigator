@@ -70,9 +70,9 @@ class MainActivity : ComponentActivity() {
 		val path = intent?.getStringExtra(EXTRA_PATH) ?: return
 		val f = File(path)
 		when {
-			f.isDirectory -> vm.open(f)
+			f.isDirectory -> vm.open(LocalLoc(f))
 			f.isFile -> {
-				f.parentFile?.let(vm::open)
+				f.parentFile?.let { vm.open(LocalLoc(it)) }
 				FileOps.open(this, f)
 			}
 			else -> vm.toast("El acceso directo ya no existe")
