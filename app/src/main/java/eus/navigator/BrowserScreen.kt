@@ -3,6 +3,7 @@
 package eus.navigator
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -25,6 +27,11 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
@@ -48,6 +55,7 @@ import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
@@ -56,12 +64,14 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.outlined.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -102,7 +112,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextRange
@@ -117,6 +129,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.UUID
 
 private sealed interface Dialog {
 	data object NewFolder : Dialog
@@ -126,7 +139,7 @@ private sealed interface Dialog {
 	data class Details(val entries: List<Entry>) : Dialog
 	data class AddShortcut(val file: File) : Dialog
 	data class RenameShortcut(val shortcut: Shortcut) : Dialog
-	data class EditServer(val server: Server?) : Dialog
+	data class EditServer(val server: Server?, val isNew: Boolean = server == null) : Dialog
 	data class SendTo(val items: List<Loc>) : Dialog
 }
 
@@ -170,6 +183,9 @@ fun BrowserScreen(vm: BrowserViewModel) {
 				onRenameShortcut = { dialog = Dialog.RenameShortcut(it) },
 				onServer = ::openServer,
 				onEditServer = { dialog = Dialog.EditServer(it) },
+				onCopyServer = {
+					dialog = Dialog.EditServer(it.copy(id = UUID.randomUUID().toString(), name = "${it.name} (copia)"), isNew = true)
+				},
 			)
 		},
 	) {
@@ -206,6 +222,8 @@ fun BrowserScreen(vm: BrowserViewModel) {
 		)
 	}
 
+	vm.transferState?.let { TransferDialog(it, vm::cancelTransfer) }
+
 	when (val d = dialog) {
 		null -> {}
 		Dialog.NewFolder -> NameDialog("Nueva carpeta", "", onDismiss = { dialog = null }) { vm.createFolder(it) }
@@ -230,7 +248,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 			dismissButton = { TextButton({ dialog = null }) { Text("Cancelar") } },
 		)
 		is Dialog.Details -> DetailsDialog(d.entries) { dialog = null }
-		is Dialog.EditServer -> ServerDialog(d.server, onDismiss = { dialog = null }, onSave = vm::saveServer)
+		is Dialog.EditServer -> ServerDialog(d.server, d.isNew, onDismiss = { dialog = null }, onSave = vm::saveServer)
 		is Dialog.SendTo -> SendDialog(vm, d.items) { dialog = null }
 	}
 }
@@ -252,7 +270,13 @@ private fun MainBar(vm: BrowserViewModel, onMenu: () -> Unit, onDialog: (Dialog)
 			if (local != null) IconButton({
 				if (isShortcut) vm.removeShortcut(vm.shortcuts.first { it.path == local.path }) else onDialog(Dialog.AddShortcut(local.file))
 			}) {
-				Icon(if (isShortcut) Icons.Filled.Star else Icons.Outlined.Star, "Acceso directo")
+				// Ojo: Icons.Outlined.Star también es una estrella rellena; la hueca es StarBorder.
+				if (isShortcut) Icon(Icons.Filled.Star, "Quitar acceso directo", tint = MaterialTheme.colorScheme.primary)
+				else Icon(Icons.Default.StarBorder, "Crear acceso directo")
+			}
+			IconButton(vm::toggleGrid) {
+				if (vm.grid) Icon(Icons.AutoMirrored.Filled.ViewList, "Ver como lista")
+				else Icon(Icons.Default.GridView, "Ver como cuadrícula")
 			}
 			IconButton({ vm.query = "" }) { Icon(Icons.Default.Search, "Buscar") }
 			IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Más") }
@@ -394,57 +418,124 @@ private fun FileList(vm: BrowserViewModel, padding: PaddingValues, onOpenFile: (
 		}
 		return
 	}
-	val state = rememberLazyListState()
-	LaunchedEffect(vm.dir) { state.scrollToItem(0) }
-	LazyColumn(state = state, contentPadding = padding, modifier = Modifier.fillMaxSize()) {
-		items(items, key = { it.loc.path }) { e ->
-			val selected = e.loc in vm.selection
-			Row(
-				verticalAlignment = Alignment.CenterVertically,
-				modifier = Modifier
-					.fillMaxWidth()
-					.background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
-					.combinedClickable(
-						onClick = {
-							when {
-								vm.selection.isNotEmpty() -> vm.toggle(e.loc)
-								e.isDir -> vm.open(e.loc)
-								else -> onOpenFile(e)
-							}
-						},
-						onLongClick = { vm.toggle(e.loc) },
-					)
-					.padding(horizontal = 16.dp, vertical = 10.dp),
-			) {
-				Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
-					if (selected) {
-						Icon(
-							Icons.Default.Check, null,
-							tint = MaterialTheme.colorScheme.onPrimary,
-							modifier = Modifier.size(32.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary).padding(6.dp),
-						)
-					} else {
-						Icon(
-							iconFor(e), null,
-							tint = if (e.isDir) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-							modifier = Modifier.size(28.dp),
-						)
-					}
-				}
-				Spacer(Modifier.width(16.dp))
-				Column(Modifier.weight(1f)) {
-					Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge)
-					Text(
-						(if (!e.isDir) FileOps.size(e.size) else if (e.children >= 0) "${e.children} elementos" else "Carpeta") +
-							" · " + FileOps.date(e.modified),
-						style = MaterialTheme.typography.bodySmall,
-						color = MaterialTheme.colorScheme.onSurfaceVariant,
-					)
-				}
+	val onClick = { e: Entry ->
+		when {
+			vm.selection.isNotEmpty() -> vm.toggle(e.loc)
+			e.isDir -> vm.open(e.loc)
+			else -> onOpenFile(e)
+		}
+	}
+	if (vm.grid) {
+		val state = rememberLazyGridState()
+		LaunchedEffect(vm.dir) { state.scrollToItem(0) }
+		LazyVerticalGrid(
+			columns = GridCells.Fixed(2),
+			state = state,
+			contentPadding = PaddingValues(
+				start = 8.dp, end = 8.dp,
+				top = padding.calculateTopPadding() + 4.dp, bottom = padding.calculateBottomPadding() + 4.dp,
+			),
+			modifier = Modifier.fillMaxSize(),
+		) {
+			gridItems(items, key = { it.loc.path }) { e ->
+				GridItem(e, selected = e.loc in vm.selection, onClick = { onClick(e) }, onLongClick = { vm.toggle(e.loc) })
+			}
+		}
+	} else {
+		val state = rememberLazyListState()
+		LaunchedEffect(vm.dir) { state.scrollToItem(0) }
+		LazyColumn(state = state, contentPadding = padding, modifier = Modifier.fillMaxSize()) {
+			items(items, key = { it.loc.path }) { e ->
+				ListItemRow(e, selected = e.loc in vm.selection, onClick = { onClick(e) }, onLongClick = { vm.toggle(e.loc) })
 			}
 		}
 	}
 }
+
+private fun subtitle(e: Entry) =
+	(if (!e.isDir) FileOps.size(e.size) else if (e.children >= 0) "${e.children} elementos" else "Carpeta") +
+		" · " + FileOps.date(e.modified)
+
+@Composable
+private fun ListItemRow(e: Entry, selected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+	val thumb = rememberThumbnail(e)
+	Row(
+		verticalAlignment = Alignment.CenterVertically,
+		modifier = Modifier
+			.fillMaxWidth()
+			.background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+			.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+			.padding(horizontal = 16.dp, vertical = 10.dp),
+	) {
+		Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+			when {
+				selected -> SelectedMark()
+				thumb != null -> Image(
+					thumb, null, contentScale = ContentScale.Crop,
+					modifier = Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)),
+				)
+				else -> Icon(iconFor(e), null, tint = tintFor(e), modifier = Modifier.size(28.dp))
+			}
+		}
+		Spacer(Modifier.width(16.dp))
+		Column(Modifier.weight(1f)) {
+			Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyLarge)
+			Text(subtitle(e), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+		}
+	}
+}
+
+@Composable
+private fun GridItem(e: Entry, selected: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
+	val thumb: ImageBitmap? = rememberThumbnail(e)
+	Column(
+		Modifier
+			.padding(4.dp)
+			.clip(RoundedCornerShape(12.dp))
+			.background(if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+			.combinedClickable(onClick = onClick, onLongClick = onLongClick)
+			.padding(6.dp),
+	) {
+		Box(
+			Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(8.dp))
+				.background(MaterialTheme.colorScheme.surfaceVariant),
+			contentAlignment = Alignment.Center,
+		) {
+			if (thumb != null) {
+				Image(thumb, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+				if (isVideo(e.name)) Icon(
+					Icons.Default.PlayCircle, null, tint = Color.White.copy(alpha = 0.9f), modifier = Modifier.size(40.dp),
+				)
+			} else {
+				Icon(iconFor(e), null, tint = tintFor(e), modifier = Modifier.size(56.dp))
+			}
+			if (selected) Box(Modifier.align(Alignment.TopStart).padding(6.dp)) { SelectedMark() }
+		}
+		Spacer(Modifier.height(6.dp))
+		Text(
+			e.name, minLines = 2, maxLines = 2, overflow = TextOverflow.Ellipsis,
+			style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(horizontal = 2.dp),
+		)
+		Text(
+			subtitle(e), maxLines = 1, overflow = TextOverflow.Ellipsis,
+			style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+			modifier = Modifier.padding(horizontal = 2.dp),
+		)
+	}
+}
+
+@Composable
+private fun SelectedMark() {
+	Icon(
+		Icons.Default.Check, null,
+		tint = MaterialTheme.colorScheme.onPrimary,
+		modifier = Modifier.size(32.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary).padding(6.dp),
+	)
+}
+
+@Composable
+private fun tintFor(e: Entry) =
+	if (e.isDir) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
 
 @Composable
 private fun PasteBar(clip: Clip, vm: BrowserViewModel) {
@@ -474,6 +565,7 @@ private fun Drawer(
 	onRenameShortcut: (Shortcut) -> Unit,
 	onServer: (Server) -> Unit,
 	onEditServer: (Server?) -> Unit,
+	onCopyServer: (Server) -> Unit,
 ) {
 	val ctx = LocalContext.current
 	ModalDrawerSheet {
@@ -559,6 +651,7 @@ private fun Drawer(
 							IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Opciones") }
 							DropdownMenu(menu, { menu = false }) {
 								DropdownMenuItem({ Text("Editar") }, { menu = false; onEditServer(s) })
+								DropdownMenuItem({ Text("Duplicar") }, { menu = false; onCopyServer(s) })
 								StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
 								if (i > 0) DropdownMenuItem({ Text("Subir") }, { menu = false; vm.moveServer(s, -1) })
 								if (i < vm.servers.lastIndex) DropdownMenuItem({ Text("Bajar") }, { menu = false; vm.moveServer(s, 1) })
@@ -671,7 +764,7 @@ private fun DetailsDialog(entries: List<Entry>, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun ServerDialog(initial: Server?, onDismiss: () -> Unit, onSave: (Server) -> Unit) {
+private fun ServerDialog(initial: Server?, isNew: Boolean, onDismiss: () -> Unit, onSave: (Server) -> Unit) {
 	var name by remember { mutableStateOf(initial?.name.orEmpty()) }
 	var host by remember { mutableStateOf(initial?.address.orEmpty()) }
 	var user by remember { mutableStateOf(initial?.user.orEmpty()) }
@@ -680,7 +773,7 @@ private fun ServerDialog(initial: Server?, onDismiss: () -> Unit, onSave: (Serve
 	var showPassword by remember { mutableStateOf(false) }
 	AlertDialog(
 		onDismissRequest = onDismiss,
-		title = { Text(if (initial == null) "Nuevo servidor SFTP" else "Editar servidor") },
+		title = { Text(if (isNew) "Nuevo servidor SFTP" else "Editar servidor") },
 		text = {
 			Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
 				OutlinedTextField(name, { name = it }, label = { Text("Nombre") }, placeholder = { Text(host.ifBlank { "Mi servidor" }) }, singleLine = true)
@@ -788,6 +881,54 @@ private fun Dest(icon: ImageVector, title: String, subtitle: String, onClick: ()
 }
 
 @Composable
+private fun TransferDialog(t: TransferState, onCancel: () -> Unit) {
+	AlertDialog(
+		onDismissRequest = {},
+		title = { Text(t.title) },
+		text = {
+			Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+				if (t.totalBytes < 0) {
+					Text("Calculando tamaño…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+					LinearProgressIndicator(Modifier.fillMaxWidth())
+					return@Column
+				}
+				// Con archivos vacíos no hay bytes que contar: se avanza por número de archivos.
+				val fraction = when {
+					t.totalBytes > 0 -> t.bytes.toFloat() / t.totalBytes
+					t.totalFiles > 0 -> t.files.toFloat() / t.totalFiles
+					else -> 0f
+				}.coerceIn(0f, 1f)
+				Text(t.current.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+				LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+				Row {
+					Text(
+						"Archivo ${minOf(t.files + 1, t.totalFiles)} de ${t.totalFiles}",
+						style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f),
+					)
+					Text("${(fraction * 100).toInt()} %", style = MaterialTheme.typography.bodySmall)
+				}
+				val eta = if (t.speed > 0) " · quedan ${duration((t.totalBytes - t.bytes) / t.speed)}" else ""
+				Text(
+					"${FileOps.size(t.bytes)} de ${FileOps.size(t.totalBytes)}" +
+						(if (t.speed > 0) " · ${FileOps.size(t.speed)}/s" else "") + eta,
+					style = MaterialTheme.typography.bodySmall,
+					color = MaterialTheme.colorScheme.onSurfaceVariant,
+				)
+			}
+		},
+		confirmButton = {
+			TextButton(onCancel, enabled = !t.cancelling) { Text(if (t.cancelling) "Cancelando…" else "Cancelar") }
+		},
+	)
+}
+
+private fun duration(seconds: Long): String = when {
+	seconds < 60 -> "$seconds s"
+	seconds < 3600 -> "${seconds / 60} min ${seconds % 60} s"
+	else -> "${seconds / 3600} h ${seconds % 3600 / 60} min"
+}
+
+@Composable
 private fun Detail(label: String, value: String) {
 	Column {
 		Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -820,9 +961,8 @@ fun PermissionScreen(onRequest: () -> Unit) {
 
 private fun iconFor(e: Entry): ImageVector = if (e.isDir) Icons.Default.Folder else iconForName(e.name)
 
-private fun iconForName(name: String): ImageVector = when (name.substringAfterLast('.', "").lowercase()) {
-	"jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "svg" -> Icons.Default.Image
-	"mp4", "mkv", "avi", "mov", "webm", "3gp" -> Icons.Default.Movie
+private fun iconForName(name: String): ImageVector = if (isImage(name)) Icons.Default.Image else if (isVideo(name)) Icons.Default.Movie else when (name.substringAfterLast('.', "").lowercase()) {
+	"svg" -> Icons.Default.Image
 	"mp3", "wav", "ogg", "flac", "m4a", "aac", "opus" -> Icons.Default.AudioFile
 	"pdf" -> Icons.Default.PictureAsPdf
 	"zip", "rar", "7z", "tar", "gz", "xz" -> Icons.Default.FolderZip

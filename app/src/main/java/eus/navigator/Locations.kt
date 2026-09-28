@@ -3,6 +3,8 @@ package eus.navigator
 import android.content.Context
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 
 /** Una ubicación navegable: un archivo o carpeta local, o una ruta en un servidor SFTP. */
 sealed interface Loc {
@@ -24,6 +26,22 @@ data class RemoteLoc(val server: Server, override val path: String) : Loc {
 	override val name: String get() = if (path == "/") server.name else path.substringAfterLast('/')
 	override val parent get() = if (path == "/") null else RemoteLoc(server, path.substringBeforeLast('/').ifEmpty { "/" })
 	override fun child(name: String) = RemoteLoc(server, if (path == "/") "/$name" else "$path/$name")
+}
+
+class CancelledException : IOException("Cancelado")
+
+/** Progreso de una transferencia. Lo escribe el hilo de IO; la interfaz lo consulta periódicamente. */
+class Progress {
+	@Volatile var totalBytes = -1L
+	@Volatile var totalFiles = 0
+	@Volatile var bytes = 0L
+	@Volatile var files = 0
+	@Volatile var current: String? = null
+	@Volatile var cancelled = false
+
+	fun check() {
+		if (cancelled) throw CancelledException()
+	}
 }
 
 /** Operaciones sobre [Loc] que eligen la implementación local o SFTP. Todas bloquean: llamar desde IO. */
@@ -61,51 +79,90 @@ object Fs {
 		is RemoteLoc -> Sftp.delete(loc)
 	}
 
-	fun copy(src: Loc, destDir: Loc, progress: (String) -> Unit) {
-		if (src is LocalLoc && destDir is LocalLoc) {
-			progress(src.name)
-			return FileOps.copy(src.file, destDir.file)
-		}
+	fun copy(src: Loc, destDir: Loc, p: Progress) {
 		val dir = isDir(src) ?: throw IOException("«${src.name}» ya no existe")
 		require(!(dir && isInside(destDir, src))) { "No se puede copiar una carpeta dentro de sí misma" }
-		transfer(src, dir, uniqueName(destDir, src.name), progress)
+		transfer(src, dir, uniqueName(destDir, src.name), p)
 	}
 
-	fun move(src: Loc, destDir: Loc, progress: (String) -> Unit) {
+	fun move(src: Loc, destDir: Loc, p: Progress) {
+		if (src.parent?.let { isSame(it, destDir) } == true) return
 		if (src is LocalLoc && destDir is LocalLoc) {
-			progress(src.name)
-			return FileOps.move(src.file, destDir.file)
+			require(!(src.file.isDirectory && isInside(destDir, src))) { "No se puede mover una carpeta dentro de sí misma" }
+			// renameTo solo funciona dentro del mismo volumen; si falla, se copia y se borra más abajo.
+			if (src.file.renameTo(FileOps.uniqueName(destDir.file, src.name))) return
 		}
 		if (src is RemoteLoc && destDir is RemoteLoc && src.server.id == destDir.server.id) {
-			if (src.parent?.path == destDir.path) return
 			require(!isInside(destDir, src)) { "No se puede mover una carpeta dentro de sí misma" }
-			progress(src.name)
 			return Sftp.rename(src, uniqueName(destDir, src.name) as RemoteLoc)
 		}
-		// Entre dispositivos distintos no hay renombrado posible: copia y borra.
-		copy(src, destDir, progress)
+		// El original solo se borra cuando la copia ha terminado entera.
+		copy(src, destDir, p)
+		p.check()
 		delete(src)
 	}
 
-	/** Copia de un archivo o carpeta entre dos ubicaciones cualesquiera usando flujos. */
-	private fun transfer(src: Loc, isDir: Boolean, target: Loc, progress: (String) -> Unit) {
-		if (isDir) {
-			mkdir(target)
-			for (e in list(src, showHidden = true, SortBy.NAME, false)) transfer(e.loc, e.isDir, target.child(e.name), progress)
-			return
+	/** Mide lo que se va a transferir para poder mostrar el progreso. */
+	fun measure(items: List<Loc>, p: Progress) {
+		var bytes = 0L
+		var files = 0
+		fun walk(loc: Loc, isDir: Boolean, size: Long) {
+			p.check()
+			if (!isDir) { bytes += size; files++; return }
+			list(loc, showHidden = true, SortBy.NAME, false).forEach { walk(it.loc, it.isDir, it.size) }
 		}
-		progress(src.name)
-		read(src) { input -> write(target) { input.copyTo(it) } }
+		for (item in items) when (item) {
+			is LocalLoc -> FileOps.totals(listOf(item.file)).let { (b, c) -> bytes += b; files += c }
+			is RemoteLoc -> Sftp.stat(item)?.let { walk(item, it.isDir, it.size) }
+		}
+		p.totalBytes = bytes
+		p.totalFiles = files
 	}
 
-	private fun <T> read(loc: Loc, block: (java.io.InputStream) -> T): T = when (loc) {
+	/** Copia de un archivo o carpeta entre dos ubicaciones cualesquiera usando flujos. */
+	private fun transfer(src: Loc, isDir: Boolean, target: Loc, p: Progress) {
+		p.check()
+		if (isDir) {
+			mkdir(target)
+			for (e in list(src, showHidden = true, SortBy.NAME, false)) transfer(e.loc, e.isDir, target.child(e.name), p)
+			return
+		}
+		p.current = src.name
+		try {
+			read(src) { input -> write(target) { pump(input, it, p) } }
+		} catch (e: Exception) {
+			// No deja archivos a medias si se cancela o falla.
+			runCatching { delete(target) }
+			throw e
+		}
+		p.files++
+	}
+
+	private fun pump(input: InputStream, output: OutputStream, p: Progress) {
+		val buf = ByteArray(64 * 1024)
+		while (true) {
+			p.check()
+			val n = input.read(buf)
+			if (n < 0) break
+			output.write(buf, 0, n)
+			p.bytes += n
+		}
+	}
+
+	private fun <T> read(loc: Loc, block: (InputStream) -> T): T = when (loc) {
 		is LocalLoc -> loc.file.inputStream().use(block)
 		is RemoteLoc -> Sftp.read(loc, block)
 	}
 
-	private fun write(loc: Loc, block: (java.io.OutputStream) -> Unit) = when (loc) {
+	private fun write(loc: Loc, block: (OutputStream) -> Unit) = when (loc) {
 		is LocalLoc -> loc.file.outputStream().use(block)
 		is RemoteLoc -> Sftp.write(loc, block)
+	}
+
+	private fun isSame(a: Loc, b: Loc) = when {
+		a is LocalLoc && b is LocalLoc -> a.file.canonicalPath == b.file.canonicalPath
+		a is RemoteLoc && b is RemoteLoc -> a.server.id == b.server.id && a.path == b.path
+		else -> false
 	}
 
 	fun isInside(child: Loc, parent: Loc): Boolean = when {
@@ -128,11 +185,18 @@ object Fs {
 	}
 
 	/** Archivo local con el contenido de [loc]; los remotos se descargan a la caché para abrirlos o compartirlos. */
-	fun localCopy(context: Context, loc: Loc): File = when (loc) {
+	fun localCopy(context: Context, loc: Loc, p: Progress): File = when (loc) {
 		is LocalLoc -> loc.file
 		is RemoteLoc -> File(context.cacheDir, "sftp/${loc.server.id}${loc.path}").also { f ->
 			f.parentFile?.mkdirs()
-			Sftp.read(loc) { input -> f.outputStream().use { input.copyTo(it) } }
+			p.current = loc.name
+			try {
+				Sftp.read(loc) { input -> f.outputStream().use { pump(input, it, p) } }
+			} catch (e: Exception) {
+				f.delete()
+				throw e
+			}
+			p.files++
 		}
 	}
 

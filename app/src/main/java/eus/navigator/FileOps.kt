@@ -106,22 +106,6 @@ object FileOps {
 		return c == p || c.startsWith("$p/")
 	}
 
-	fun copy(src: File, destDir: File) {
-		require(!(src.isDirectory && isInside(destDir, src))) { "No se puede copiar una carpeta dentro de sí misma" }
-		val target = uniqueName(destDir, src.name)
-		if (!src.copyRecursively(target)) error("No se pudo copiar ${src.name}")
-	}
-
-	fun move(src: File, destDir: File) {
-		if (src.parentFile?.canonicalPath == destDir.canonicalPath) return
-		require(!(src.isDirectory && isInside(destDir, src))) { "No se puede mover una carpeta dentro de sí misma" }
-		val target = uniqueName(destDir, src.name)
-		// renameTo solo funciona dentro del mismo volumen; si no, copia y borra.
-		if (src.renameTo(target)) return
-		if (!src.copyRecursively(target)) error("No se pudo mover ${src.name}")
-		if (!src.deleteRecursively()) error("Copiado, pero no se pudo borrar el original de ${src.name}")
-	}
-
 	fun mime(file: File): String = mime(file.name)
 
 	fun mime(name: String): String =

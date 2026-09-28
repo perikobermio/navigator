@@ -10,11 +10,25 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
 data class Clip(val items: List<Loc>, val cut: Boolean)
+
+/** Foto del progreso de una transferencia para la interfaz. totalBytes < 0 mientras se mide. */
+data class TransferState(
+	val title: String,
+	val current: String?,
+	val bytes: Long,
+	val totalBytes: Long,
+	val files: Int,
+	val totalFiles: Int,
+	/** Bytes por segundo de media desde el inicio. */
+	val speed: Long,
+	val cancelling: Boolean,
+)
 
 class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	private val prefs = app.getSharedPreferences("settings", 0)
@@ -33,6 +47,9 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		private set
 	var busy by mutableStateOf<String?>(null)
 		private set
+	var transferState by mutableStateOf<TransferState?>(null)
+		private set
+	private var progress: Progress? = null
 
 	var selection by mutableStateOf(emptySet<Loc>())
 		private set
@@ -42,9 +59,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	var showHidden by mutableStateOf(prefs.getBoolean("hidden", false))
 		private set
-	var sort by mutableStateOf(SortBy.entries[prefs.getInt("sort", 0)])
+	var sort by mutableStateOf(SortBy.entries[prefs.getInt("sortBy", SortBy.DATE.ordinal)])
 		private set
-	var descending by mutableStateOf(prefs.getBoolean("desc", false))
+	var descending by mutableStateOf(prefs.getBoolean("sortDesc", true))
+		private set
+	var grid by mutableStateOf(prefs.getBoolean("grid", false))
 		private set
 
 	var shortcuts by mutableStateOf(store.load())
@@ -61,6 +80,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	init {
 		Sftp.init(app)
+		Thumbnails.init(app)
 		openStart()
 	}
 
@@ -139,10 +159,16 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		refresh()
 	}
 
+	fun toggleGrid() {
+		grid = !grid
+		prefs.edit().putBoolean("grid", grid).apply()
+	}
+
 	fun changeSort(by: SortBy) {
 		// Pulsar el criterio activo invierte el sentido.
 		if (by == sort) descending = !descending else { sort = by; descending = by != SortBy.NAME && by != SortBy.TYPE }
-		prefs.edit().putInt("sort", sort.ordinal).putBoolean("desc", descending).apply()
+		// Claves nuevas ("sortBy"/"sortDesc") para que el nuevo orden por defecto, fecha descendente, se aplique a todos.
+		prefs.edit().putInt("sortBy", sort.ordinal).putBoolean("sortDesc", descending).apply()
 		refresh()
 	}
 
@@ -190,14 +216,45 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
 	private fun transfer(items: List<Loc>, cut: Boolean, destName: String? = null, dest: () -> Loc) {
 		selection = emptySet()
-		val verb = if (cut) "Moviendo" else "Copiando"
-		run("$verb…") {
+		runTransfer(if (cut) "Moviendo" else "Copiando") { p ->
 			val target = dest()
-			items.forEach { item ->
-				val progress = { name: String -> busy = "$verb «$name»…" }
-				if (cut) Fs.move(item, target, progress) else Fs.copy(item, target, progress)
-			}
+			Fs.measure(items, p)
+			items.forEach { if (cut) Fs.move(it, target, p) else Fs.copy(it, target, p) }
 			if (destName != null) toast("${items.size} ${if (items.size == 1) "elemento" else "elementos"} a «$destName»")
+		}
+	}
+
+	fun cancelTransfer() {
+		progress?.cancelled = true
+	}
+
+	/** Como [run], pero con progreso detallado y cancelable. */
+	private fun runTransfer(title: String, reload: Boolean = true, block: suspend (Progress) -> Unit) {
+		val p = Progress()
+		progress = p
+		viewModelScope.launch {
+			val started = System.nanoTime()
+			// La interfaz se actualiza por muestreo, no en cada bloque copiado.
+			val ticker = launch {
+				while (true) {
+					val secs = (System.nanoTime() - started) / 1e9
+					transferState = TransferState(
+						title, p.current, p.bytes, p.totalBytes, p.files, p.totalFiles,
+						speed = if (secs > 0.5) (p.bytes / secs).toLong() else 0, cancelling = p.cancelled,
+					)
+					delay(250)
+				}
+			}
+			try {
+				withContext(Dispatchers.IO) { block(p) }
+			} catch (e: Exception) {
+				toast(e.message ?: "Error")
+			} finally {
+				ticker.cancel()
+				transferState = null
+				progress = null
+				if (reload) refresh()
+			}
 		}
 	}
 
@@ -244,11 +301,10 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		val files = items.filter { !it.isDir }
 		if (files.isEmpty()) return toast("Solo se pueden usar archivos, no carpetas")
 		if (files.all { it.loc is LocalLoc }) return then(files.map { (it.loc as LocalLoc).file })
-		run("Descargando…", reload = false) {
-			val local = files.map { e ->
-				busy = "Descargando «${e.name}»…"
-				Fs.localCopy(getApplication(), e.loc)
-			}
+		runTransfer("Descargando", reload = false) { p ->
+			p.totalFiles = files.size
+			p.totalBytes = files.sumOf { it.size }
+			val local = files.map { Fs.localCopy(getApplication(), it.loc, p) }
 			withContext(Dispatchers.Main) { then(local) }
 		}
 	}
