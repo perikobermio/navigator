@@ -184,10 +184,18 @@ object Fs {
 		return target
 	}
 
-	/** Archivo local con el contenido de [loc]; los remotos se descargan a la caché para abrirlos o compartirlos. */
-	fun localCopy(context: Context, loc: Loc, p: Progress): File = when (loc) {
+	/**
+	 * Archivo local con el contenido de [loc]; los remotos se descargan a la caché para abrirlos o compartirlos.
+	 * Si ya se descargó y el remoto no ha cambiado ([size] y [modified] coinciden), se reutiliza.
+	 */
+	fun localCopy(context: Context, loc: Loc, p: Progress, size: Long = -1, modified: Long = 0): File = when (loc) {
 		is LocalLoc -> loc.file
 		is RemoteLoc -> File(context.cacheDir, "sftp/${loc.server.id}${loc.path}").also { f ->
+			if (size >= 0 && f.length() == size && f.lastModified() == modified) {
+				p.bytes += size
+				p.files++
+				return f
+			}
 			f.parentFile?.mkdirs()
 			p.current = loc.name
 			try {
@@ -196,6 +204,7 @@ object Fs {
 				f.delete()
 				throw e
 			}
+			f.setLastModified(modified)
 			p.files++
 		}
 	}

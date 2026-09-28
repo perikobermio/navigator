@@ -304,7 +304,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		runTransfer("Descargando", reload = false) { p ->
 			p.totalFiles = files.size
 			p.totalBytes = files.sumOf { it.size }
-			val local = files.map { Fs.localCopy(getApplication(), it.loc, p) }
+			val local = files.map { Fs.localCopy(getApplication(), it.loc, p, it.size, it.modified) }
 			withContext(Dispatchers.Main) { then(local) }
 		}
 	}

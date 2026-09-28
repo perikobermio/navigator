@@ -114,16 +114,33 @@ object FileOps {
 	private fun uri(context: Context, file: File): Uri =
 		FileProvider.getUriForFile(context, "${context.packageName}.files", file)
 
+	/** Abre con la app predeterminada del tipo; si el tipo es desconocido o nadie lo abre, deja elegir cualquier app. */
 	fun open(context: Context, file: File) {
-		val intent = Intent(Intent.ACTION_VIEW)
-			.setDataAndType(uri(context, file), mime(file))
-			.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+		val mime = mime(file)
+		if (mime != "*/*") {
+			try {
+				context.startActivity(viewIntent(context, file, mime))
+				return
+			} catch (_: ActivityNotFoundException) {
+			}
+		}
+		chooser(context, file, "*/*")
+	}
+
+	/** Pregunta siempre con qué app abrir. */
+	fun openWith(context: Context, file: File) = chooser(context, file, mime(file))
+
+	private fun chooser(context: Context, file: File, mime: String) {
 		try {
-			context.startActivity(Intent.createChooser(intent, file.name))
+			context.startActivity(Intent.createChooser(viewIntent(context, file, mime), "Abrir «${file.name}» con"))
 		} catch (_: ActivityNotFoundException) {
 			Toast.makeText(context, "Ninguna app puede abrir este archivo", Toast.LENGTH_SHORT).show()
 		}
 	}
+
+	private fun viewIntent(context: Context, file: File, mime: String) = Intent(Intent.ACTION_VIEW)
+		.setDataAndType(uri(context, file), mime)
+		.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
 
 	fun share(context: Context, files: List<File>) {
 		val uris = files.filter { it.isFile }.map { uri(context, it) }

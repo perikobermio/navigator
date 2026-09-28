@@ -149,6 +149,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 	val scope = rememberCoroutineScope()
 	val ctx = LocalContext.current
 	var dialog by remember { mutableStateOf<Dialog?>(null) }
+	var viewer by remember { mutableStateOf<Pair<List<Entry>, Int>?>(null) }
 
 	BackHandler(drawer.isOpen) { scope.launch { drawer.close() } }
 	BackHandler(!drawer.isOpen && vm.selection.isNotEmpty()) { vm.clearSelection() }
@@ -204,7 +205,14 @@ fun BrowserScreen(vm: BrowserViewModel) {
 			},
 			bottomBar = { vm.clip?.let { PasteBar(it, vm) } },
 		) { padding ->
-			FileList(vm, padding, onOpenFile = { e -> vm.withLocalFiles(listOf(e)) { FileOps.open(ctx, it[0]) } })
+			FileList(vm, padding, onOpenFile = { e ->
+				if (isImage(e.name)) {
+					val images = vm.visible.filter { !it.isDir && isImage(it.name) }
+					viewer = images to images.indexOf(e).coerceAtLeast(0)
+				} else {
+					vm.withLocalFiles(listOf(e)) { FileOps.open(ctx, it[0]) }
+				}
+			})
 		}
 	}
 
@@ -221,6 +229,8 @@ fun BrowserScreen(vm: BrowserViewModel) {
 			},
 		)
 	}
+
+	viewer?.let { (images, start) -> ImageViewer(vm, images, start) { viewer = null } }
 
 	vm.transferState?.let { TransferDialog(it, vm::cancelTransfer) }
 
@@ -326,6 +336,13 @@ private fun SelectionBar(vm: BrowserViewModel, onDialog: (Dialog) -> Unit) {
 					(sel[0] as? LocalLoc)?.let { l ->
 						DropdownMenuItem({ Text("Crear acceso directo") }, { menu = false; onDialog(Dialog.AddShortcut(l.file)) })
 					}
+				}
+				if (sel.size == 1 && vm.selectedEntries.singleOrNull()?.isDir == false) {
+					DropdownMenuItem({ Text("Abrir con…") }, {
+						menu = false
+						vm.withLocalFiles(vm.selectedEntries) { FileOps.openWith(ctx, it[0]) }
+						vm.clearSelection()
+					})
 				}
 				DropdownMenuItem({ Text("Compartir") }, { menu = false; vm.withLocalFiles(vm.selectedEntries) { FileOps.share(ctx, it) } })
 				DropdownMenuItem({ Text("Detalles") }, { menu = false; onDialog(Dialog.Details(vm.selectedEntries)) })
