@@ -59,6 +59,8 @@ class MainActivity : ComponentActivity() {
 		checkPermission()
 		// Refresca al volver (p. ej. tras conceder permiso o editar un archivo en otra app).
 		if (granted) if (before) vm.refresh() else vm.refreshRoots()
+		// La sincronización automática puede haber corrido en segundo plano.
+		vm.reloadSync()
 	}
 
 	override fun onNewIntent(intent: Intent) {

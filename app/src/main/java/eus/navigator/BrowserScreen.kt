@@ -68,6 +68,7 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Visibility
@@ -203,7 +204,9 @@ fun BrowserScreen(vm: BrowserViewModel) {
 					else Spacer(Modifier.height(2.dp))
 				}
 			},
-			bottomBar = { vm.clip?.let { PasteBar(it, vm) } },
+			bottomBar = {
+				if (vm.pickingSource) PickSourceBar(vm) else vm.clip?.let { PasteBar(it, vm) }
+			},
 		) { padding ->
 			FileList(vm, padding, onOpenFile = { e ->
 				if (isImage(e.name)) {
@@ -261,6 +264,18 @@ fun BrowserScreen(vm: BrowserViewModel) {
 		is Dialog.EditServer -> ServerDialog(d.server, d.isNew, onDismiss = { dialog = null }, onSave = vm::saveServer)
 		is Dialog.SendTo -> SendDialog(vm, d.items) { dialog = null }
 	}
+
+	// El editor se oculta mientras se navega para elegir una carpeta de origen.
+	vm.syncDraft?.takeIf { !vm.pickingSource }?.let { SyncDialog(vm, it) }
+	vm.syncPreview?.let { (rule, items) -> SyncPreviewDialog(vm, rule, items) }
+	vm.errorDialog?.let { (title, msg) ->
+		AlertDialog(
+			onDismissRequest = { vm.errorDialog = null },
+			title = { Text(title) },
+			text = { Text(msg) },
+			confirmButton = { TextButton({ vm.errorDialog = null }) { Text("Aceptar") } },
+		)
+	}
 }
 
 @Composable
@@ -287,6 +302,9 @@ private fun MainBar(vm: BrowserViewModel, onMenu: () -> Unit, onDialog: (Dialog)
 			IconButton(vm::toggleGrid) {
 				if (vm.grid) Icon(Icons.AutoMirrored.Filled.ViewList, "Ver como lista")
 				else Icon(Icons.Default.GridView, "Ver como cuadrícula")
+			}
+			vm.currentRule?.let { rule ->
+				IconButton({ vm.syncNow(rule.target) }) { Icon(Icons.Default.Sync, "Sincronizar ahora") }
 			}
 			IconButton({ vm.query = "" }) { Icon(Icons.Default.Search, "Buscar") }
 			IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Más") }
@@ -620,6 +638,7 @@ private fun Drawer(
 			}
 			itemsIndexed(vm.shortcuts, key = { _, s -> s.path }) { i, s ->
 				var menu by remember { mutableStateOf(false) }
+				val syncKey = vm.key(s)
 				val f = File(s.path)
 				NavigationDrawerItem(
 					icon = {
@@ -634,11 +653,18 @@ private fun Drawer(
 					},
 					label = { TwoLines(s.name, s.path) },
 					badge = {
-						Box {
+						Row(verticalAlignment = Alignment.CenterVertically) {
+							if (vm.ruleFor(syncKey) != null) Icon(
+								Icons.Default.Sync, "Con sincronización", Modifier.size(18.dp),
+								tint = if (vm.ruleFor(syncKey)?.lastError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+							)
 							IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Opciones") }
 							DropdownMenu(menu, { menu = false }) {
 								DropdownMenuItem({ Text("Renombrar") }, { menu = false; onRenameShortcut(s) })
-								if (!f.isFile) StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
+								if (!f.isFile) {
+									StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
+									SyncMenuItems(vm, syncKey) { menu = false }
+								}
 								if (i > 0) DropdownMenuItem({ Text("Subir") }, { menu = false; vm.moveShortcut(s, -1) })
 								if (i < vm.shortcuts.lastIndex) DropdownMenuItem({ Text("Bajar") }, { menu = false; vm.moveShortcut(s, 1) })
 								DropdownMenuItem({ Text("Añadir a pantalla de inicio") }, { menu = false; pinToHome(ctx, s) })
@@ -660,16 +686,22 @@ private fun Drawer(
 			if (vm.servers.isEmpty()) item { Hint("Pulsa + para añadir un servidor SFTP.") }
 			itemsIndexed(vm.servers, key = { _, s -> "sftp:${s.id}" }) { i, s ->
 				var menu by remember { mutableStateOf(false) }
+				val syncKey = vm.key(s)
 				NavigationDrawerItem(
 					icon = { Icon(if (vm.isStart(s)) Icons.Default.Home else Icons.Default.Dns, null) },
 					label = { TwoLines(s.name, "${s.user}@${s.address}:${s.path.ifBlank { "~" }}") },
 					badge = {
-						Box {
+						Row(verticalAlignment = Alignment.CenterVertically) {
+							if (vm.ruleFor(syncKey) != null) Icon(
+								Icons.Default.Sync, "Con sincronización", Modifier.size(18.dp),
+								tint = if (vm.ruleFor(syncKey)?.lastError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+							)
 							IconButton({ menu = true }) { Icon(Icons.Default.MoreVert, "Opciones") }
 							DropdownMenu(menu, { menu = false }) {
 								DropdownMenuItem({ Text("Editar") }, { menu = false; onEditServer(s) })
 								DropdownMenuItem({ Text("Duplicar") }, { menu = false; onCopyServer(s) })
 								StartMenuItem(vm.isStart(s)) { menu = false; vm.toggleStart(s) }
+								SyncMenuItems(vm, syncKey) { menu = false }
 								if (i > 0) DropdownMenuItem({ Text("Subir") }, { menu = false; vm.moveServer(s, -1) })
 								if (i < vm.servers.lastIndex) DropdownMenuItem({ Text("Bajar") }, { menu = false; vm.moveServer(s, 1) })
 								DropdownMenuItem({ Text("Quitar") }, { menu = false; vm.removeServer(s) })
@@ -685,6 +717,17 @@ private fun Drawer(
 }
 
 @Composable
+private fun SyncMenuItems(vm: BrowserViewModel, key: String, close: () -> Unit) {
+	val rule = vm.ruleFor(key)
+	DropdownMenuItem(
+		text = { Text(if (rule == null) "Sincronizar desde…" else "Configurar sincronización") },
+		onClick = { close(); vm.editSync(key) },
+		leadingIcon = { Icon(Icons.Default.Sync, null) },
+	)
+	if (rule != null) DropdownMenuItem({ Text("Sincronizar ahora") }, { close(); vm.syncNow(key) })
+}
+
+@Composable
 private fun StartMenuItem(isStart: Boolean, onClick: () -> Unit) {
 	DropdownMenuItem(
 		text = { Text(if (isStart) "No abrir al iniciar" else "Abrir al iniciar") },
@@ -694,7 +737,7 @@ private fun StartMenuItem(isStart: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun TwoLines(title: String, subtitle: String) {
+fun TwoLines(title: String, subtitle: String) {
 	Column {
 		Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
 		Text(
@@ -978,7 +1021,7 @@ fun PermissionScreen(onRequest: () -> Unit) {
 
 private fun iconFor(e: Entry): ImageVector = if (e.isDir) Icons.Default.Folder else iconForName(e.name)
 
-private fun iconForName(name: String): ImageVector = if (isImage(name)) Icons.Default.Image else if (isVideo(name)) Icons.Default.Movie else when (name.substringAfterLast('.', "").lowercase()) {
+fun iconForName(name: String): ImageVector = if (isImage(name)) Icons.Default.Image else if (isVideo(name)) Icons.Default.Movie else when (name.substringAfterLast('.', "").lowercase()) {
 	"svg" -> Icons.Default.Image
 	"mp3", "wav", "ogg", "flac", "m4a", "aac", "opus" -> Icons.Default.AudioFile
 	"pdf" -> Icons.Default.PictureAsPdf

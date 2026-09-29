@@ -1,6 +1,7 @@
 package eus.navigator
 
 import android.app.Application
+import android.util.Log
 import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,6 +35,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	private val prefs = app.getSharedPreferences("settings", 0)
 	private val store = ShortcutStore(app)
 	private val serverStore = ServerStore(app)
+	private val syncStore = SyncStore(app)
 
 	var roots by mutableStateOf(FileOps.roots(app))
 		private set
@@ -49,6 +51,9 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		private set
 	var transferState by mutableStateOf<TransferState?>(null)
 		private set
+	/** Error que merece un diálogo (no un aviso que desaparece), p. ej. al sincronizar. */
+	var errorDialog by mutableStateOf<Pair<String, String>?>(null)
+	
 	private var progress: Progress? = null
 
 	var selection by mutableStateOf(emptySet<Loc>())
@@ -72,6 +77,18 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		private set
 
 	/** Ubicación que se abre al iniciar: "path:<ruta>" para un acceso directo o "sftp:<id>" para un servidor. */
+	var syncRules by mutableStateOf(syncStore.load())
+		private set
+	/** Regla que se está editando; se guarda al confirmar el editor. */
+	var syncDraft by mutableStateOf<SyncRule?>(null)
+		private set
+	/** true mientras se navega para elegir la carpeta de origen de [syncDraft]. */
+	var pickingSource by mutableStateOf(false)
+		private set
+	/** Cambios calculados pendientes de que el usuario los valide. */
+	var syncPreview by mutableStateOf<Pair<SyncRule, List<SyncItem>>?>(null)
+		private set
+
 	var start by mutableStateOf(prefs.getString("start", null))
 		private set
 
@@ -228,8 +245,8 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		progress?.cancelled = true
 	}
 
-	/** Como [run], pero con progreso detallado y cancelable. */
-	private fun runTransfer(title: String, reload: Boolean = true, block: suspend (Progress) -> Unit) {
+	/** Como [run], pero con progreso detallado y cancelable. Con [errorTitle], los errores salen en un diálogo. */
+	private fun runTransfer(title: String, reload: Boolean = true, errorTitle: String? = null, block: suspend (Progress) -> Unit) {
 		val p = Progress()
 		progress = p
 		viewModelScope.launch {
@@ -247,8 +264,12 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 			}
 			try {
 				withContext(Dispatchers.IO) { block(p) }
+			} catch (e: CancelledException) {
+				toast("Cancelado")
 			} catch (e: Exception) {
-				toast(e.message ?: "Error")
+				Log.w("Navigator", title, e)
+				val msg = e.message ?: e.javaClass.simpleName
+				if (errorTitle != null) errorDialog = errorTitle to msg else toast(msg)
 			} finally {
 				ticker.cancel()
 				transferState = null
@@ -278,6 +299,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 			if (loc is LocalLoc) {
 				shortcuts = shortcuts.map { if (it.path == loc.path) it.copy(path = target.path) else it }.also(store::save)
 				if (start == "path:${loc.path}") saveStart("path:${target.path}")
+				ruleFor("path:${loc.path}")?.let { r ->
+					Sync.unschedule(getApplication(), r.target)
+					saveRules(syncRules.map { if (it === r) it.copy(target = "path:${target.path}") else it })
+					Sync.schedule(getApplication(), r.copy(target = "path:${target.path}"))
+				}
 			}
 		}
 	}
@@ -341,6 +367,7 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 	fun removeShortcut(s: Shortcut) {
 		shortcuts = (shortcuts - s).also(store::save)
 		if (isStart(s)) saveStart(null)
+		removeSync(key(s))
 	}
 
 	fun moveShortcut(s: Shortcut, delta: Int) {
@@ -377,6 +404,9 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		Sftp.forget(s)
 		servers = servers.filterNot { it.id == s.id }.also(serverStore::save)
 		if (isStart(s)) saveStart(null)
+		removeSync(key(s))
+		// Los orígenes que apuntaban a este servidor dejan de tener sentido.
+		saveRules(syncRules.map { r -> r.copy(sources = r.sources.filterNot { it.place.serverId == s.id }) })
 		if ((dir as? RemoteLoc)?.server?.id == s.id) open(LocalLoc(roots.first().dir))
 	}
 
@@ -384,15 +414,136 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 		servers = swap(servers, s, delta).also(serverStore::save)
 	}
 
+	// --- Sincronización ---
+
+	fun key(s: Shortcut) = "path:${s.path}"
+
+	fun key(s: Server) = "sftp:${s.id}"
+
+	fun ruleFor(key: String) = syncRules.find { it.target == key }
+
+	/** Nombre visible del destino de una regla. */
+	fun targetName(key: String): String = when {
+		key.startsWith("path:") -> shortcuts.find { key(it) == key }?.name ?: key.removePrefix("path:")
+		else -> servers.find { key(it) == key }?.name ?: "Servidor"
+	}
+
+	/** Regla de la carpeta que se está viendo, si es un acceso directo o un servidor sincronizado. */
+	val currentRule: SyncRule?
+		get() = when (val d = dir) {
+			is LocalLoc -> ruleFor("path:${d.path}")
+			is RemoteLoc -> ruleFor("sftp:${d.server.id}")
+		}
+
+	fun reloadSync() {
+		syncRules = syncStore.load()
+	}
+
+	fun editSync(key: String) {
+		syncDraft = ruleFor(key) ?: SyncRule(key)
+	}
+
+	fun updateDraft(rule: SyncRule) {
+		syncDraft = rule
+	}
+
+	fun cancelDraft() {
+		syncDraft = null
+		pickingSource = false
+	}
+
+	/** Oculta el editor para navegar hasta la carpeta de origen; [pickSource] la añade. */
+	fun startPickingSource() {
+		pickingSource = true
+		toast("Navega hasta la carpeta de origen y pulsa «Usar esta carpeta»")
+	}
+
+	fun pickSource() {
+		val draft = syncDraft ?: return
+		val place = PlaceRef.of(dir)
+		pickingSource = false
+		if (draft.sources.any { it.place == place }) return toast("Esa carpeta ya es un origen")
+		syncDraft = draft.copy(sources = draft.sources + SyncSource(place))
+	}
+
+	fun cancelPicking() {
+		pickingSource = false
+	}
+
+	fun saveDraft() {
+		val draft = syncDraft ?: return
+		syncDraft = null
+		saveRules(syncRules.filterNot { it.target == draft.target } + draft)
+		Sync.schedule(getApplication(), draft)
+		toast(if (draft.auto) "Sincronización automática activada" else "Sincronización guardada")
+	}
+
+	fun removeSync(key: String) {
+		if (syncDraft?.target == key) syncDraft = null
+		if (ruleFor(key) == null) return
+		Sync.unschedule(getApplication(), key)
+		saveRules(syncRules.filterNot { it.target == key })
+	}
+
+	private fun saveRules(list: List<SyncRule>) {
+		syncRules = list
+		syncStore.save(list)
+	}
+
+	/** Calcula los cambios y los muestra para validarlos antes de copiar. */
+	fun syncNow(key: String) {
+		val rule = ruleFor(key) ?: return
+		if (rule.sources.isEmpty()) return toast("Añade al menos una carpeta de origen")
+		val servers = servers
+		runTransfer("Buscando cambios", reload = false, errorTitle = "No se pudo sincronizar") { p ->
+			val items = try {
+				Sync.plan(rule, servers, p)
+			} catch (e: Exception) {
+				if (e !is CancelledException) {
+					syncStore.recordRun(key, 0, e.message ?: e.javaClass.simpleName)
+					reloadSync()
+				}
+				throw e
+			}
+			if (items.isEmpty()) {
+				syncStore.recordRun(key, 0, null)
+				reloadSync()
+				toast("«${targetName(key)}» está al día")
+			} else {
+				syncPreview = rule to items
+			}
+		}
+	}
+
+	fun cancelPreview() {
+		syncPreview = null
+	}
+
+	fun confirmSync(items: List<SyncItem>) {
+		val (rule, _) = syncPreview ?: return
+		syncPreview = null
+		if (items.isEmpty()) return
+		runTransfer("Sincronizando «${targetName(rule.target)}»", errorTitle = "No se pudo sincronizar") { p ->
+			try {
+				val r = Sync.run(items, p)
+				syncStore.recordRun(rule.target, r.copied, r.error)
+				if (r.failed == 0) toast("${r.copied} archivos sincronizados")
+				else errorDialog = "Sincronización incompleta" to "${r.copied} copiados, ${r.failed} con error.\n\nPrimer error: ${r.error}"
+			} finally {
+				reloadSync()
+			}
+		}
+	}
+
 	// --- Ubicación de inicio ---
 
-	fun isStart(s: Shortcut) = start == "path:${s.path}"
+	fun isStart(s: Shortcut) = start == key(s)
 
-	fun isStart(s: Server) = start == "sftp:${s.id}"
+	fun isStart(s: Server) = start == key(s)
 
-	fun toggleStart(s: Shortcut) = saveStart(if (isStart(s)) null else "path:${s.path}")
+	fun toggleStart(s: Shortcut) = saveStart(if (isStart(s)) null else key(s))
 
-	fun toggleStart(s: Server) = saveStart(if (isStart(s)) null else "sftp:${s.id}")
+	fun toggleStart(s: Server) = saveStart(if (isStart(s)) null else key(s))
 
 	private fun saveStart(key: String?) {
 		start = key

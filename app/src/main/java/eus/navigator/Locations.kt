@@ -46,6 +46,9 @@ class Progress {
 
 /** Operaciones sobre [Loc] que eligen la implementación local o SFTP. Todas bloquean: llamar desde IO. */
 object Fs {
+	/** Sufijo de los temporales de [replaceFile]; la sincronización los ignora si quedan huérfanos. */
+	const val PART = ".navigator-part"
+
 	fun list(dir: Loc, showHidden: Boolean, sort: SortBy, descending: Boolean): List<Entry> = when (dir) {
 		is LocalLoc -> FileOps.sorted(FileOps.list(dir.file, showHidden), sort, descending)
 		is RemoteLoc -> FileOps.sorted(Sftp.list(dir, showHidden), sort, descending)
@@ -134,6 +137,49 @@ object Fs {
 			// No deja archivos a medias si se cancela o falla.
 			runCatching { delete(target) }
 			throw e
+		}
+		p.files++
+	}
+
+	fun mkdirs(loc: Loc) = when (loc) {
+		is LocalLoc -> if (!loc.file.isDirectory && !loc.file.mkdirs()) throw IOException("No se pudo crear ${loc.path}") else Unit
+		is RemoteLoc -> Sftp.mkdirs(loc)
+	}
+
+	/**
+	 * Copia un archivo sobrescribiendo [dest] y le pone la fecha del original.
+	 * Escribe primero en un temporal oculto: si se corta, el archivo que ya hubiera en [dest] sigue intacto.
+	 */
+	fun replaceFile(src: Loc, dest: Loc, modified: Long, p: Progress) {
+		// Sin punto delante: muchos servidores SFTP de hosting prohíben crear archivos ocultos.
+		val tmp = dest.parent?.child("${dest.name}$PART") ?: throw IOException("Destino no válido")
+		p.current = src.name
+		val before = p.bytes
+		try {
+			read(src) { input -> write(tmp) { pump(input, it, p) } }
+			if (exists(dest)) delete(dest)
+			rename(tmp, dest)
+		} catch (e: CancelledException) {
+			runCatching { delete(tmp) }
+			throw e
+		} catch (e: IOException) {
+			runCatching { delete(tmp) }
+			// Algunos servidores no dejan crear el temporal o renombrarlo: se reintenta escribiendo directamente.
+			p.bytes = before
+			try {
+				read(src) { input -> write(dest) { pump(input, it, p) } }
+			} catch (e2: CancelledException) {
+				throw e2
+			} catch (e2: IOException) {
+				throw IOException("${e2.message} (${dest.path})", e2)
+			}
+		}
+		// Si el sistema no deja cambiar la fecha, el destino queda más nuevo que el original y tampoco se recopia.
+		runCatching {
+			when (dest) {
+				is LocalLoc -> dest.file.setLastModified(modified)
+				is RemoteLoc -> Sftp.setModified(dest, modified)
+			}
 		}
 		p.files++
 	}

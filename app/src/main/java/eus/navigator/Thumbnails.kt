@@ -22,8 +22,8 @@ import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 
-private val IMAGE_EXT = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif")
-private val VIDEO_EXT = setOf("mp4", "mkv", "avi", "mov", "webm", "3gp")
+val IMAGE_EXT = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif")
+val VIDEO_EXT = setOf("mp4", "mkv", "avi", "mov", "webm", "3gp")
 
 fun isImage(name: String) = name.substringAfterLast('.', "").lowercase() in IMAGE_EXT
 

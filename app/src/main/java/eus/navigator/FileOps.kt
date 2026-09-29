@@ -4,6 +4,7 @@ import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -114,9 +115,32 @@ object FileOps {
 	private fun uri(context: Context, file: File): Uri =
 		FileProvider.getUriForFile(context, "${context.packageName}.files", file)
 
+	/**
+	 * Nombres alternativos de tipos que las apps registran de formas distintas. Android da a veces uno
+	 * que casi nadie usa (p. ej. application/vnd.rar, que en muchos móviles solo reclaman lectores de cómics).
+	 */
+	private val ALIASES = mapOf(
+		"rar" to listOf("application/x-rar-compressed", "application/rar", "application/vnd.rar", "application/x-rar"),
+		"zip" to listOf("application/zip", "application/x-zip-compressed"),
+		"7z" to listOf("application/x-7z-compressed"),
+		"tar" to listOf("application/x-tar"),
+		"gz" to listOf("application/gzip", "application/x-gzip"),
+		"tgz" to listOf("application/gzip", "application/x-gzip"),
+		"xz" to listOf("application/x-xz"),
+		"bz2" to listOf("application/x-bzip2"),
+	)
+
+	/** De los nombres posibles del tipo de [file], el que más apps saben abrir. */
+	private fun bestMime(context: Context, file: File): String {
+		val candidates = (ALIASES[file.extension.lowercase()].orEmpty() + mime(file)).distinct()
+		if (candidates.size == 1) return candidates[0]
+		val pm = context.packageManager
+		return candidates.maxBy { pm.queryIntentActivities(viewIntent(context, file, it), PackageManager.MATCH_DEFAULT_ONLY).size }
+	}
+
 	/** Abre con la app predeterminada del tipo; si el tipo es desconocido o nadie lo abre, deja elegir cualquier app. */
 	fun open(context: Context, file: File) {
-		val mime = mime(file)
+		val mime = bestMime(context, file)
 		if (mime != "*/*") {
 			try {
 				context.startActivity(viewIntent(context, file, mime))
@@ -128,7 +152,7 @@ object FileOps {
 	}
 
 	/** Pregunta siempre con qué app abrir. */
-	fun openWith(context: Context, file: File) = chooser(context, file, mime(file))
+	fun openWith(context: Context, file: File) = chooser(context, file, bestMime(context, file))
 
 	private fun chooser(context: Context, file: File, mime: String) {
 		try {

@@ -123,6 +123,20 @@ object Sftp {
 
 	fun mkdir(loc: RemoteLoc) = use(loc.server) { it.mkdir(loc.path) }
 
+	/** Crea la carpeta y las intermedias que falten. */
+	fun mkdirs(loc: RemoteLoc) = use(loc.server) { ch ->
+		var path = ""
+		for (part in loc.path.split('/').filter { it.isNotEmpty() }) {
+			path += "/$part"
+			val exists = try { ch.stat(path).isDir } catch (e: SftpException) {
+				if (e.id == ChannelSftp.SSH_FX_NO_SUCH_FILE) false else throw e
+			}
+			if (!exists) ch.mkdir(path)
+		}
+	}
+
+	fun setModified(loc: RemoteLoc, millis: Long) = use(loc.server) { it.setMtime(loc.path, (millis / 1000).toInt()) }
+
 	fun createFile(loc: RemoteLoc) = use(loc.server) { it.put(ByteArrayInputStream(ByteArray(0)), loc.path) }
 
 	fun rename(from: RemoteLoc, to: RemoteLoc) = use(from.server) { it.rename(from.path, to.path) }
